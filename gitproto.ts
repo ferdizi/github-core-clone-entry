@@ -249,8 +249,9 @@ export function mergeBase(store: ObjectStore, a: string, b: string): string | nu
   if (ca === cb) return ca;
   const fromA = new Set<string>();
   const qa: string[] = [ca];
-  while (qa.length > 0) {
-    const oid = qa.shift()!;
+  let ha = 0;
+  while (ha < qa.length) {
+    const oid = qa[ha++];
     if (fromA.has(oid)) continue;
     fromA.add(oid);
     const obj = store.objects.get(oid);
@@ -258,8 +259,9 @@ export function mergeBase(store: ObjectStore, a: string, b: string): string | nu
   }
   const qb: string[] = [cb];
   const seenB = new Set<string>();
-  while (qb.length > 0) {
-    const oid = qb.shift()!;
+  let hb = 0;
+  while (hb < qb.length) {
+    const oid = qb[hb++];
     if (seenB.has(oid)) continue;
     seenB.add(oid);
     if (fromA.has(oid)) return oid;
@@ -269,17 +271,23 @@ export function mergeBase(store: ObjectStore, a: string, b: string): string | nu
   return null;
 }
 
-/** Commit generation (distance from tip) for commits reachable from tips. */
-export function commitGenerations(store: ObjectStore, tips: string[]): Map<string, number> {
+/** Commit generation (distance from tip) for commits reachable from tips.
+ *  When maxDepth is set, only generations < maxDepth are computed: parents
+ *  that would land at generation >= maxDepth are never visited. This is the
+ *  clone fast path (a depth-1 fetch needs only the tip, not the whole
+ *  history). Uses an index pointer, not shift(), so the queue is O(1). */
+export function commitGenerations(store: ObjectStore, tips: string[], maxDepth?: number): Map<string, number> {
   const gen = new Map<string, number>();
   const queue: { oid: string; g: number }[] = [];
   for (const t of tips) queue.push({ oid: peelToCommit(store, t), g: 0 });
-  while (queue.length > 0) {
-    const { oid, g } = queue.shift()!;
+  let head = 0;
+  while (head < queue.length) {
+    const { oid, g } = queue[head++];
     if (gen.has(oid)) continue;
     const obj = store.objects.get(oid);
     if (!obj || obj.type !== 'commit') continue;
     gen.set(oid, g);
+    if (maxDepth !== undefined && g + 1 >= maxDepth) continue;
     for (const p of parseCommit(obj.data).parents) queue.push({ oid: p, g: g + 1 });
   }
   return gen;
@@ -349,7 +357,8 @@ export function collectFetch(
   oldShallow: string[],
 ): { packObjects: Set<string>; shallowOut: string[]; unshallowOut: string[] } {
   const held = heldClosure(store, haves, oldShallow);
-  const gen = commitGenerations(store, wants);
+  // Depth-limit the generation walk: a depth-1 fetch needs only the tip.
+  const gen = commitGenerations(store, wants, depth);
   const included = new Set<string>();
   for (const [oid, g] of gen) {
     if (depth === undefined || g < depth) included.add(oid);
@@ -557,7 +566,11 @@ export function writePack(store: ObjectStore, oids: Iterable<string>): Buffer {
     parts.push(writePackObjectHeader(obj.type, obj.data.length));
     parts.push(deflateSync(obj.data));
   }
-  const trailer = createHash('sha1').update(Buffer.concat(parts)).digest();
+  // Hash incrementally over the parts instead of Buffer.concat-ing the whole
+  // pack once just to hash it and again to return it.
+  const hash = createHash('sha1');
+  for (const p of parts) hash.update(p);
+  const trailer = hash.digest();
   parts.push(trailer);
   return Buffer.concat(parts);
 }
@@ -640,6 +653,8 @@ export function readPack(store: ObjectStore, buf: Buffer): RawPackEntry[] {
     dataEnd: number;
     baseOffset?: number;
     baseOid?: string;
+    /** Inflated payload captured during the scan, so resolve() never re-inflates. */
+    inflated?: Buffer;
   }
   const metas: EntryMeta[] = [];
   let pos = 12;
@@ -670,7 +685,8 @@ export function readPack(store: ObjectStore, buf: Buffer): RawPackEntry[] {
       meta.baseOid = buf.subarray(i, i + 20).toString('hex');
       meta.dataStart = i + 20;
     }
-    // Inflate to find consumed length.
+    // Inflate ONCE here to find the consumed length; keep the payload so
+    // resolve() reuses it instead of inflating a second time.
     const view = buf.subarray(meta.dataStart, buf.length - 20);
     const inflated = inflateSync(view, { info: true }) as unknown as {
       buffer: Buffer;
@@ -678,6 +694,7 @@ export function readPack(store: ObjectStore, buf: Buffer): RawPackEntry[] {
     };
     const consumed = inflated.engine.bytesWritten;
     meta.dataEnd = meta.dataStart + consumed;
+    meta.inflated = inflated.buffer;
     metas.push(meta);
     pos = meta.dataEnd;
   }
@@ -687,8 +704,8 @@ export function readPack(store: ObjectStore, buf: Buffer): RawPackEntry[] {
   const resolve = (meta: EntryMeta, depth: number): { type: ObjType; data: Buffer; oid: string } => {
     if (resolved.has(meta.offset)) return resolved.get(meta.offset)!;
     if (depth > 100) throw new Error('pack delta chain too deep');
-    const view = buf.subarray(meta.dataStart, meta.dataEnd);
-    const raw = inflateSync(view);
+    // Reuse the payload inflated during the scan (no second inflate).
+    const raw = meta.inflated ?? inflateSync(buf.subarray(meta.dataStart, meta.dataEnd));
     if (meta.typeCode === 6 || meta.typeCode === 7) {
       let base: { type: ObjType; data: Buffer } | undefined;
       if (meta.typeCode === 6) {

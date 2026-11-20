@@ -403,7 +403,10 @@ export function handleReceivePack(
     try {
       const entries = readPack(repo, packBytes);
       for (const e of entries) putObject(repo, e.type, e.data);
-      // Verify every new tip's closure is complete.
+      // Verify every new tip's closure is complete. Only objects this pack
+      // added are walked: an object already in the store was verified when
+      // it arrived, so re-walking the whole ancestry on every push is O(n^2).
+      const fresh = new Set<string>(entries.map((e) => e.oid));
       for (const c of commands) {
         if (c.newOid === ZERO_OID) continue;
         const obj = getObject(repo, c.newOid);
@@ -412,6 +415,9 @@ export function handleReceivePack(
           const check = (oid: string, seen: Set<string>): boolean => {
             if (seen.has(oid)) return true;
             seen.add(oid);
+            // Already in the store before this pack: verified on arrival, so
+            // only confirm the reference resolves; do not re-walk it.
+            if (!fresh.has(oid)) return getObject(repo, oid) !== undefined;
             const o = getObject(repo, oid);
             if (!o) return false;
             if (o.type === 'commit') {
